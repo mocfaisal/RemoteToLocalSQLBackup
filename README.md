@@ -8,3 +8,4 @@ This solution in general looks like this:
 - drop temp table and db;
 
 More info at my blog post there: https://www.ok.unsode.com/post/2015/06/27/remote-sql-backup-to-local-pc
+Forked from : https://github.com/okarpov/RemoteToLocalSQLBackup

@@ -1,12 +1,7 @@
-﻿/*
-okarpov: oleksandr karpov, 2015
-*/
-
-using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Text;
+﻿using System;
 using System.Data.SqlClient;
+using System.IO;
+using System.Security.Cryptography;
 
 namespace RemoteToLocalSQLBackup
 {
@@ -14,20 +9,19 @@ namespace RemoteToLocalSQLBackup
     {
         SqlConnection sqlConnection = null;
         SqlCommand sqlCmd = null;
-
+        string logTxt = string.Empty;
         string tmpDBName = "TempoBak";
-        const string getDBSize = "USE [{0}] SELECT CAST(SUM(size) * 8 / 1024 AS BIGINT) FROM sys.database_files;";//"USE [{0}] SELECT CAST(SUM(size) * 8. / 1024 AS BIGINT) FROM sys.master_files WITH(NOWAIT) WHERE database_id = DB_ID() GROUP BY database_id";
+        const string getDBSize = "USE [{0}] SELECT CAST(SUM(size) * 8 / 1024 AS BIGINT) FROM sys.database_files;";
         const string createBakFiles1 = "BACKUP DATABASE [{0}] TO DISK = N'{0}{1}_tmp_1.bak'";
         const string createBakFiles2 = " ,DISK = N'{0}{1}_tmp_{2}.bak'";
-        const string createBakFiles3 = " WITH NOFORMAT, NOINIT,  NAME = N'{0}{1}-Full Database Backup', SKIP, NOREWIND, NOUNLOAD,  STATS = 10";
+        const string createBakFiles3 = " WITH NOFORMAT, NOINIT, NAME = N'{0}{1}-Full Database Backup', SKIP, NOREWIND, NOUNLOAD, STATS = 10";
         const string getBackupPath = "SELECT TOP 1 physical_device_name FROM msdb.dbo.backupset b JOIN msdb.dbo.backupmediafamily m ON b.media_set_id = m.media_set_id WHERE database_name = '{0}' and backup_finish_date >=N'{1:yyyy-MM-dd}' and backup_finish_date < N'{2:yyyy-MM-dd}' ORDER BY backup_finish_date DESC";
-        //const string tempDB = "IF db_id('TempoBak') IS NULL begin create database TempoBak; end else begin use master; ALTER DATABASE TempoBak SET SINGLE_USER WITH ROLLBACK IMMEDIATE; drop database TempoBak; create database TempoBak; end use TempoBak; create table Temp (filename nvarchar(512), [file] varbinary(max)); use {0};";
-        const string tempDB = "IF db_id('{0}') IS NULL begin create database [{0}]; end else begin use master; ALTER DATABASE [{0}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; drop database [{0}]; create database [{0}]; end";
-        const string tempTbl = "use [{0}]; create table Temp (filename nvarchar(512), [file] varbinary(max)); use [{1}];";
-        const string insertBakFile = "INSERT INTO [{0}].dbo.Temp([filename], [file]) SELECT N'{1}' as [filename], * FROM OPENROWSET(BULK N'{1}', SINGLE_BLOB) AS [file]";
+        const string tempDB = "IF db_id('{0}') IS NULL BEGIN CREATE DATABASE [{0}]; END ELSE BEGIN USE master; ALTER DATABASE [{0}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE [{0}]; CREATE DATABASE [{0}]; END";
+        const string tempTbl = "USE [{0}]; CREATE TABLE Temp (filename NVARCHAR(512), [file] VARBINARY(MAX)); USE [{1}];";
+        const string insertBakFile = "INSERT INTO [{0}].dbo.Temp([filename], [file]) SELECT N'{1}' AS [filename], * FROM OPENROWSET(BULK N'{1}', SINGLE_BLOB) AS [file]";
         const string bakFileName = "{0}\\{1}_tmp_{2}.bak";
         const string deleteRowsFromTemp = "DELETE FROM [{0}].dbo.Temp";
-        const string deleteTempDB = "use master; ALTER DATABASE [{0}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; drop database [{0}];";
+        const string deleteTempDB = "USE master; ALTER DATABASE [{0}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE [{0}];";
 
         string dbName = string.Empty;
         string defaultBakPath = string.Empty;
@@ -44,11 +38,15 @@ namespace RemoteToLocalSQLBackup
             sqlConnection.Open();
         }
 
-        /// <summary>
-        /// Get size of DB in MB
-        /// </summary>
-        /// <param name="dbName"></param>
-        /// <returns></returns>
+        public SqlBackup(string connectionString, string remotePath, string localPath, bool useSameDBASTemp)
+        {
+            this.defaultBakPath = remotePath;
+            this.localPath = localPath;
+            this.useSameDB = useSameDBASTemp;
+            sqlConnection = new SqlConnection(connectionString);
+            sqlConnection.Open();
+        }
+
         public long GetDBSize()
         {
             sqlCmd = new SqlCommand(string.Format(getDBSize, sqlConnection.Database), sqlConnection);
@@ -64,14 +62,10 @@ namespace RemoteToLocalSQLBackup
             return dbSize;
         }
 
-        /// <summary>
-        /// Create BAK files (default backup path)
-        /// </summary>
-        /// <returns></returns>
         public int CreateBakupFiles()
         {
             backExt = DateTime.UtcNow;
-            string script = string.Format(createBakFiles1, sqlConnection.Database, backExt.ToString("yyyyMMddhhmm"));
+            string script = string.Format(createBakFiles1, sqlConnection.Database, backExt.ToString("yyyyMMddHHmm"));
 
             int numberOfFiles = (int)(dbSize / 80); //try to make each bak file 80MB in size
 
@@ -83,10 +77,10 @@ namespace RemoteToLocalSQLBackup
 
             for (int i = 2; i <= numberOfFiles; i++)
             {
-                script += string.Format(createBakFiles2, sqlConnection.Database, backExt.ToString("yyyyMMddhhmm"), i);
+                script += string.Format(createBakFiles2, sqlConnection.Database, backExt.ToString("yyyyMMddHHmm"), i);
             }
 
-            script += string.Format(createBakFiles3, sqlConnection.Database, backExt.ToString("yyyyMMddhhmm"));
+            script += string.Format(createBakFiles3, sqlConnection.Database, backExt.ToString("yyyyMMddHHmm"));
 
             sqlCmd = new SqlCommand(script, sqlConnection);
             sqlCmd.CommandTimeout = sqlConnection.ConnectionTimeout;
@@ -94,174 +88,380 @@ namespace RemoteToLocalSQLBackup
 
             sqlCmd.CommandText = string.Format(getBackupPath, sqlConnection.Database, DateTime.Now.Date, DateTime.Now.Date.AddDays(1));
             defaultBakPath = sqlCmd.ExecuteScalar() as string;
-            defaultBakPath = System.IO.Path.GetDirectoryName(defaultBakPath);
+            defaultBakPath = Path.GetDirectoryName(defaultBakPath);
 
             sqlCmd.Dispose();
 
             return numberOfFiles;
         }
 
-        /// <summary>
-        /// Create temp DB and table
-        /// </summary>
         public void CreateTempDB()
         {
-            if(useSameDB)
+            if (useSameDB)
             {
                 tmpDBName = sqlConnection.Database;
-                //return;
             }
             string workingDBName = sqlConnection.Database;
             string cmd = string.Format(tempTbl, tmpDBName, sqlConnection.Database);
             if (!useSameDB)
             {
                 sqlCmd = new SqlCommand(string.Format(tempDB, tmpDBName), sqlConnection);
-
                 sqlCmd.ExecuteNonQuery();
-
                 sqlCmd.Dispose();
             }
 
             sqlCmd = new SqlCommand(cmd, sqlConnection);
             sqlCmd.ExecuteNonQuery();
-
-
             sqlCmd.Dispose();
         }
 
-        /// <summary>
-        /// Insert a bak file into temp table
-        /// </summary>
-        /// <param name="i"></param>
         public void InsertBakFile(int i)
         {
-            sqlCmd = new SqlCommand(string.Format(insertBakFile, tmpDBName, string.Format(bakFileName, this.defaultBakPath, sqlConnection.Database+ backExt.ToString("yyyyMMddhhmm"), i)), sqlConnection);
+            sqlCmd = new SqlCommand(string.Format(insertBakFile, tmpDBName, string.Format(bakFileName, defaultBakPath, sqlConnection.Database + backExt.ToString("yyyyMMddHHmm"), i)), sqlConnection);
             sqlCmd.CommandTimeout = sqlConnection.ConnectionTimeout;
             sqlCmd.ExecuteNonQuery();
-
             sqlCmd.Dispose();
         }
 
-        /// <summary>
-        /// Starts downloading asynchronously
-        /// </summary>
-        /// <param name="i"></param>
-        /// <param name="callbak"></param>
-        public void DownloadBakFile(int i, Action<object> callbak)
+        public string DownloadBakFile(int i)
         {
-            SqlCommand sqlCmd2 = new SqlCommand("SELECT * FROM [" + tmpDBName + "].dbo.Temp WHERE [filename] = " +
-                string.Format(bakFileName, this.defaultBakPath, sqlConnection.Database, i), new SqlConnection(sqlConnection.ConnectionString));
-            sqlCmd2.CommandTimeout = sqlConnection.ConnectionTimeout;
-            sqlCmd2.Connection.Open();
-            sqlCmd2.BeginExecuteReader(new AsyncCallback(CallBack), new { sqlCmd2, callbak, i }, System.Data.CommandBehavior.SequentialAccess);
-        }
 
-        /// <summary>
-        /// Download bak file
-        /// </summary>
-        /// <param name="i"></param>
-        /// <param name="callbak"></param>
-        public void DownloadBakFile(int i)
-        {
-            sqlCmd = new SqlCommand("SELECT * FROM [" + tmpDBName + "].dbo.Temp WHERE [filename] = N'" +
-                string.Format(bakFileName, this.defaultBakPath, sqlConnection.Database, i) + "'", sqlConnection);
-            sqlCmd.CommandTimeout = sqlConnection.ConnectionTimeout;
-            SqlDataReader sqldr = sqlCmd.ExecuteReader(System.Data.CommandBehavior.SequentialAccess);
+            string remoteFileName = string.Format(bakFileName, this.defaultBakPath, sqlConnection.Database + backExt.ToString("yyyyMMddHHmm"), i);
+            string localFileName = Path.Combine(this.localPath, Path.GetFileName(remoteFileName));
 
-            sqldr.Read();
-            string fileName = sqldr.GetString(0);
-
-
-            System.IO.FileStream file = new System.IO.FileStream(System.IO.Path.Combine(this.localPath, System.IO.Path.GetFileName(fileName)),
-                System.IO.FileMode.OpenOrCreate, System.IO.FileAccess.ReadWrite);
-
-            long startIndex = 0;
-
-            const int ChunkSize = 1024 * 32; //32 KB block
-
-            byte[] buffer = new byte[ChunkSize];
-            while (true)
+            try
             {
-                long retrievedBytes = sqldr.GetBytes(1, startIndex, buffer, 0, ChunkSize);
-                file.Write(buffer, 0, (int)retrievedBytes);
-                startIndex += retrievedBytes;
-                if (retrievedBytes != ChunkSize)
-                    break;
+                sqlCmd = new SqlCommand("SELECT * FROM [" + tmpDBName + "].dbo.Temp WHERE [filename] = N'" + remoteFileName + "'", sqlConnection);
+                sqlCmd.CommandTimeout = sqlConnection.ConnectionTimeout;
+                SqlDataReader sqldr = sqlCmd.ExecuteReader(System.Data.CommandBehavior.SequentialAccess);
+
+                sqldr.Read();
+                string fileName = sqldr.GetString(0);
+
+                using (FileStream file = new FileStream(localFileName, FileMode.OpenOrCreate, FileAccess.ReadWrite))
+                {
+                    long startIndex = 0;
+                    const int ChunkSize = 1024 * 32; // 32 KB block
+                    byte[] buffer = new byte[ChunkSize];
+
+                    while (true)
+                    {
+                        long retrievedBytes = sqldr.GetBytes(1, startIndex, buffer, 0, ChunkSize);
+                        file.Write(buffer, 0, (int)retrievedBytes);
+                        startIndex += retrievedBytes;
+                        if (retrievedBytes != ChunkSize)
+                            break;
+                    }
+                }
+
+                sqldr.Close();
+                sqlCmd.Dispose();
+
+                // Delete the remote file after downloading
+                DeleteRemoteBakFile(remoteFileName);
+                logTxt = $"File downloaded and deleted successfully: {localFileName}";
+                Console.WriteLine(logTxt);
+            }
+            catch (UnauthorizedAccessException ex)
+            {
+                logTxt = $"Access to the path '{localFileName}' is denied: {ex.Message}";
+                Console.WriteLine(logTxt);
+            }
+            catch (FileNotFoundException ex)
+            {
+                logTxt = $"File not found: {remoteFileName}. Exception: {ex.Message}";
+                Console.WriteLine(logTxt);
+            }
+            catch (Exception ex)
+            {
+                logTxt = $"Error downloading the file: {ex.Message}";
+                Console.WriteLine(logTxt);
+            }
+            return logTxt;
+        }
+        public string CombineDownloadedBakFile(int numberOfFiles)
+        {
+            string logTxt = string.Empty;
+            string finalFileName = Path.Combine(localPath, $"{sqlConnection.Database + backExt.ToString("yyyyMMddHHmm")}.bak");
+
+            try
+            {
+                // Ensure the directory exists
+                string directoryPath = Path.GetDirectoryName(finalFileName);
+                if (!Directory.Exists(directoryPath))
+                {
+                    Directory.CreateDirectory(directoryPath);
+                }
+
+                using (FileStream finalFile = new FileStream(finalFileName, FileMode.Create, FileAccess.Write))
+                {
+                    for (int i = 1; i <= numberOfFiles; i++)
+                    {
+                        string fileName = Path.Combine(localPath, $"{sqlConnection.Database + backExt.ToString("yyyyMMddHHmm")}_tmp_{i}.bak");
+
+                        if (File.Exists(fileName))
+                        {
+                            using (FileStream splitFile = new FileStream(fileName, FileMode.Open, FileAccess.Read))
+                            {
+                                splitFile.CopyTo(finalFile);
+                            }
+
+                            // Delete the local split file after combining
+                            File.Delete(fileName);
+
+                            Console.WriteLine($"Split file {i} added to the final backup file and deleted from local.");
+                        }
+                        else
+                        {
+                            logTxt = $"Split file {fileName} not found.";
+                            Console.WriteLine(logTxt);
+                        }
+                    }
+                }
+
+                logTxt = $"Combined file created successfully: {finalFileName}";
+                Console.WriteLine(logTxt);
+
+                // Calculate MD5 hash for combined local file
+                string localHash = CalculateMD5(finalFileName);
+
+                // Calculate MD5 hash for remote file
+                string remoteFilePath = Path.Combine(defaultBakPath, $"{sqlConnection.Database + backExt.ToString("yyyyMMddHHmm")}.bak");
+                string remoteHash = CalculateMD5(remoteFilePath);
+
+                // Compare hashes
+                if (localHash == remoteHash)
+                {
+                    Console.WriteLine("Hashes match. Deleting remote backup files.");
+
+                    // Delete remote backup files
+                    for (int i = 1; i <= numberOfFiles; i++)
+                    {
+                        string remoteFileName = string.Format(bakFileName, defaultBakPath, sqlConnection.Database + backExt.ToString("yyyyMMddHHmm"), i);
+                        DeleteRemoteBakFile(remoteFileName);
+                    }
+
+                    Console.WriteLine("Remote backup files deleted successfully.");
+                }
+                else
+                {
+                    Console.WriteLine("Hashes do not match. Remote files will not be deleted.");
+                }
+            }
+            catch (UnauthorizedAccessException ex)
+            {
+                logTxt = $"Access to the path '{localPath}' is denied: {ex.Message}";
+                Console.WriteLine(logTxt);
+            }
+            catch (Exception ex)
+            {
+                logTxt = $"Error combining the file: {ex.Message}";
+                Console.WriteLine(logTxt);
             }
 
-            file.Close();
-            sqlCmd.Dispose();
+            return logTxt;
         }
 
-        /// <summary>
-        /// delete bak file
-        /// </summary>
-        /// <param name="i"></param>
+        public void DownloadBackupFileByName(string backupFileName)
+        {
+            string remoteFilePath = Path.Combine(defaultBakPath, backupFileName + ".bak");
+            string localFilePath = Path.Combine(localPath, backupFileName + ".bak");
+
+            try
+            {
+                // Ensure the directory exists
+                string directoryPath = Path.GetDirectoryName(localFilePath);
+                if (!Directory.Exists(directoryPath))
+                {
+                    Directory.CreateDirectory(directoryPath);
+                }
+
+                // Read the file from the remote server
+                using (FileStream remoteFile = new FileStream(remoteFilePath, FileMode.Open, FileAccess.Read))
+                {
+                    // Write the file to the local directory
+                    using (FileStream localFile = new FileStream(localFilePath, FileMode.Create, FileAccess.Write))
+                    {
+                        remoteFile.CopyTo(localFile);
+                    }
+                }
+
+                // Calculate MD5 hash for remote file
+                string remoteHash = CalculateMD5(remoteFilePath);
+
+                // Calculate MD5 hash for local file
+                string localHash = CalculateMD5(localFilePath);
+
+                // Compare hashes
+                if (remoteHash == localHash)
+                {
+                    Console.WriteLine($"File downloaded successfully: {localFilePath}");
+                    Console.WriteLine($"MD5 Hash: {localHash}");
+
+                    // Delete remote file if hashes match
+                    DeleteRemoteBackupFile(remoteFilePath);
+                    Console.WriteLine($"Remote file deleted: {remoteFilePath}");
+                }
+                else
+                {
+                    Console.WriteLine($"Error: Hashes do not match. Downloaded file may be corrupted.");
+                }
+
+                Console.WriteLine($"File downloaded successfully: {localFilePath}");
+            }
+            catch (UnauthorizedAccessException ex)
+            {
+                Console.WriteLine($"Access to the path '{localPath}' is denied: {ex.Message}");
+            }
+            catch (FileNotFoundException ex)
+            {
+                Console.WriteLine($"File not found: {remoteFilePath}. Exception: {ex.Message}");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error downloading the file: {ex.Message}\n" +
+                    "Remote Path : " + remoteFilePath + "\n" +
+                    "Local Path : " + localFilePath);
+            }
+        }
+
         public void DeleteBakFile()
         {
-            sqlCmd = new SqlCommand(string.Format(deleteRowsFromTemp, tmpDBName), sqlConnection);
-            sqlCmd.CommandTimeout = sqlConnection.ConnectionTimeout;
-            sqlCmd.ExecuteNonQuery();
-            sqlCmd.Dispose();
+            try
+            {
+                // Ensure the command is properly initialized
+                sqlCmd = new SqlCommand(string.Format(deleteRowsFromTemp, tmpDBName), sqlConnection);
+                sqlCmd.CommandTimeout = sqlConnection.ConnectionTimeout;
+                sqlCmd.ExecuteNonQuery();
+                Console.WriteLine("Temporary backup files deleted successfully from the database.");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error deleting temporary backup files: {ex.Message}");
+            }
+            finally
+            {
+                if (sqlCmd != null)
+                {
+                    sqlCmd.Dispose();
+                }
+            }
         }
 
-        /// <summary>
-        /// Delete temp rows and temp db
-        /// </summary>
         public void DeleteTempDB()
         {
-            sqlCmd = new SqlCommand(string.Format(deleteRowsFromTemp, tmpDBName), sqlConnection);
-            sqlCmd.CommandTimeout = sqlConnection.ConnectionTimeout;
-            sqlCmd.ExecuteNonQuery();
-            if (!useSameDB)
+            try
             {
-                sqlCmd.CommandText = string.Format(deleteTempDB, tmpDBName);
+                // Delete rows from the temporary table
+                sqlCmd = new SqlCommand(string.Format(deleteRowsFromTemp, tmpDBName), sqlConnection);
+                sqlCmd.CommandTimeout = sqlConnection.ConnectionTimeout;
                 sqlCmd.ExecuteNonQuery();
+                sqlCmd.Dispose();
+
+                // Drop the temporary database if not using the same database
+                if (!useSameDB)
+                {
+                    sqlCmd = new SqlCommand(string.Format(deleteTempDB, tmpDBName), sqlConnection);
+                    sqlCmd.CommandTimeout = sqlConnection.ConnectionTimeout;
+                    sqlCmd.ExecuteNonQuery();
+                }
+
+                Console.WriteLine("Temporary database and its files deleted successfully.");
             }
-            sqlCmd.Dispose();
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error deleting temporary database: {ex.Message}");
+            }
+            finally
+            {
+                if (sqlCmd != null)
+                {
+                    sqlCmd.Dispose();
+                }
+            }
+        }
+        private void DeleteRemoteBakFile(string remoteFileName)
+        {
+            try
+            {
+                sqlCmd = new SqlCommand("DELETE FROM [" + tmpDBName + "].dbo.Temp WHERE [filename] = N'" + remoteFileName + "'", sqlConnection);
+                sqlCmd.CommandTimeout = sqlConnection.ConnectionTimeout;
+                sqlCmd.ExecuteNonQuery();
+                sqlCmd.Dispose();
+
+                // Additionally, delete the file from the file system if applicable
+                if (File.Exists(remoteFileName))
+                {
+                    File.Delete(remoteFileName);
+                    logTxt = $"Remote file deleted: {remoteFileName}";
+                    Console.WriteLine(logTxt);
+                }
+            }
+            catch (Exception ex)
+            {
+                logTxt = $"Error deleting remote file: {ex.Message}";
+                Console.WriteLine(logTxt);
+            }
+        }
+        private void DeleteRemoteBackupFile(string remoteFilePath)
+        {
+            // delete direct
+            try
+            {
+                // Add code here to delete remote file
+                File.Delete(remoteFilePath);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error deleting remote backup file: {ex.Message}");
+            }
+        }
+        public void Dispose()
+        {
+            sqlCmd?.Dispose();
+            sqlConnection?.Dispose();
         }
 
-        void CallBack(IAsyncResult ar)
+        private void CallBack(IAsyncResult ar)
         {
             SqlCommand sqlc = ((dynamic)ar.AsyncState).sqlCmd2;
             Action<object> callbak = ((dynamic)ar.AsyncState).callbak;
             SqlDataReader sqldr = sqlc.EndExecuteReader(ar);
-            sqldr.Read();
-            string fileName = sqldr.GetString(0);
 
-
-            System.IO.FileStream file = new System.IO.FileStream(System.IO.Path.Combine(this.localPath, System.IO.Path.GetFileName(fileName)), 
-                System.IO.FileMode.OpenOrCreate, System.IO.FileAccess.ReadWrite);
-
-            long startIndex = 0;
-
-            const int ChunkSize = 1024 * 8;
-
-            while (true)
+            if (sqldr.Read())
             {
-                byte[] buffer = new byte[ChunkSize];
-                long retrievedBytes = sqldr.GetBytes(1, startIndex, buffer, 0, ChunkSize);
-                file.Write(buffer, 0, (int)retrievedBytes);
-                startIndex += retrievedBytes;
-                if (retrievedBytes != ChunkSize)
-                    break;
+                string fileName = sqldr.GetString(0);
+
+                using (FileStream file = new FileStream(Path.Combine(localPath, Path.GetFileName(fileName)), FileMode.OpenOrCreate, FileAccess.ReadWrite))
+                {
+                    long startIndex = 0;
+                    const int ChunkSize = 1024 * 8;
+                    byte[] buffer = new byte[ChunkSize];
+                    while (true)
+                    {
+                        long retrievedBytes = sqldr.GetBytes(1, startIndex, buffer, 0, ChunkSize);
+                        file.Write(buffer, 0, (int)retrievedBytes);
+                        startIndex += retrievedBytes;
+                        if (retrievedBytes != ChunkSize)
+                            break;
+                    }
+                }
+                sqlc.Dispose();
+
+                callbak?.Invoke(new { fname = Path.GetFileName(fileName), i = (int)((dynamic)ar.AsyncState).i });
             }
-
-            file.Close();
-            sqlc.Dispose();
-
-            if (callbak != null)
-                callbak.Invoke(new { fname = System.IO.Path.GetFileName(fileName), i = (int)((dynamic)ar.AsyncState).i });
-
         }
 
-        public void Dispose()
+        private string CalculateMD5(string filePath)
         {
-            if (sqlConnection != null)
+            using (var md5 = MD5.Create())
             {
-                sqlConnection.Dispose();
+                using (var stream = File.OpenRead(filePath))
+                {
+                    byte[] hash = md5.ComputeHash(stream);
+                    return BitConverter.ToString(hash).Replace("-", "").ToLowerInvariant();
+                }
             }
-            sqlConnection = null;
         }
     }
 }
